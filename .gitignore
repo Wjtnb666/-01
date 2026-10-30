@@ -1,0 +1,19 @@
+# Python 虚拟环境（几百MB，不用上传）
+.venv/
+
+# PyCharm 配置
+.idea/
+
+# CIFAR-10 数据集（341MB）
+三年之约/data/data/
+
+# 训练出的模型权重
+*.pth
+
+# 个人图片（隐私）
+*.JPG
+三年之约/资源/
+
+# Python 缓存
+__pycache__/
+*.pyc
