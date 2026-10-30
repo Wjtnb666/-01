@@ -108,6 +108,7 @@ if __name__ == '__main__':
     train(net, train_dataset)
    #模型测试
     evaluate(net, test_dataset)
+    print('王佳特nb')
 
 
 
