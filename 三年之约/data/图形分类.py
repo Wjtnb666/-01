@@ -1,22 +1,28 @@
+import os
+os.environ.setdefault('OMP_NUM_THREADS', '2')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '2')
+
 import torch
 import torch.nn as nn
-from torchvision.datasets import CIFAR10
-from torchvision.transforms import ToTensor
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 import time
-from torchsummary import summary
+from tiny_imagenet_dataset import TinyImageNetTrain, TinyImageNetVal, val_transform
 
-from 三年之约.自动微分模型 import criterion
+BATCH_SIZE = 128
 
-BATCH_SIZE = 64
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 #准备数据集
 def create_dataset():
-    #参1=数据集保存路径，参2=是否是训练集，参3=数据预处理变成张量，参4=是否下载数据集
-    train_dataset = CIFAR10(root='./data', train=True, transform=ToTensor(), download=True)
-    #   测试集
-    test_dataset = CIFAR10(root='./data', train=False, transform=ToTensor(), download=True)
-    return train_dataset, test_dataset
+    train_full = TinyImageNetTrain()                        # 10万张，带增强
+    val_full = TinyImageNetTrain(transform=val_transform)   # 同一批图，但不带增强
+    val_size = int(len(train_full) * 0.1)                   # 1万张
+    train_size = len(train_full) - val_size                 # 9万张
+    generator1 = torch.Generator().manual_seed(42)
+    generator2 = torch.Generator().manual_seed(42)
+    train_set, _ = random_split(train_full, [train_size, val_size], generator=generator1)
+    _, val_set = random_split(val_full, [train_size, val_size], generator=generator2)
+    return train_set, val_set
 class imgModule(nn.Module):
     #初始化父类
     def __init__(self):
@@ -27,9 +33,9 @@ class imgModule(nn.Module):
         self.conv2=nn.Conv2d(6,16,3,1,0)
         self.pool2=nn.MaxPool2d(2,2)
         #全连接层
-        self.linear1=nn.Linear(576,120)
+        self.linear1=nn.Linear(3136,120)
         self.linear2=nn.Linear(120,84)
-        self.linear3=nn.Linear(84,10)
+        self.linear3=nn.Linear(84,200)
     def forward(self,x):
         #卷积层1：加权求和+激活函数+降维
         x=self.conv1(x)
@@ -39,76 +45,125 @@ class imgModule(nn.Module):
         x=self.conv2(x)
         x=torch.relu(x)
         x=self.pool2(x)
-        #全连接，数据转化（8，16，6，6）->（8，576）
+        #全连接，数据转化（8，16，14，14）->（8，3136）
         #参1样本数（行数）参2：特征数（列数）参3：自动计算
         x=x.reshape(x.size(0),-1)#-1表示自动计算
         x=torch.relu(self.linear1(x))
         x=torch.relu(self.linear2(x))
         x=self.linear3(x)
         return x
-def train(model, train_dataset):
+def validate(model, val_loader):
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in val_loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x).argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += len(y)
+    model.train()
+    return correct / total
+
+class imgModuleV2(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = nn.Conv2d(3, 32, 3, 1, padding=1)
+            self.bn1 = nn.BatchNorm2d(32)  # 新增
+            self.conv2 = nn.Conv2d(32, 64, 3, 1, padding=1)
+            self.bn2 = nn.BatchNorm2d(64)
+            self.pool = nn.MaxPool2d(2, 2)
+            self.dropout = nn.Dropout(0.5)
+            self.linear1 = nn.Linear(16384, 120)  # 32→16→8
+            self.linear2 = nn.Linear(120, 200)
+
+        def forward(self, x):
+            x = self.pool(torch.relu(self.bn1(self.conv1(x))))
+            x = self.pool(torch.relu(self.bn2(self.conv2(x))))
+            x = x.reshape(x.size(0), -1)
+            x = self.dropout(torch.relu(self.linear1(x)))
+            return self.linear2(x)
+def train(model, train_dataset, val_dataset, epoch=15):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=0.01)
-    epoch=200
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epoch)
+    best_acc = -1.0
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=4, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=2, pin_memory=True)
+
     for i in range(epoch):
-        dataloader=DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)#shuffle=True打乱数据顺序
         sam_num=0#样本数量
         total_loss=0#总损失
+        correct=0#本轮猜对的张数
         start=time.time()#开始时间
         #遍历数据训练
-        for x,y in dataloader:
-            # x：一个批次的图片，形状 (8, 3, 32, 32)，float32，数值 0~1
-            # y：对应的标签，形状 (8,)，如 tensor([3, 9, 1, 0, ...])，取值 0~9
+        for batch_idx,(x,y) in enumerate(train_loader):
+            x,y=x.to(device),y.to(device)
             optimizer.zero_grad()
-            # PyTorch 默认会把每次 backward 算出的梯度"累加"到参数的 .grad 里。
-            # 所以每批训练前必须清零，否则这批的梯度会和上一批混在一起。
             output=model(x)#前向传播
             loss=criterion(output,y)#损失
             loss.backward()#反向传播
             optimizer.step()#参数优化
             sam_num+=len(x)#样本数量
-            total_loss+=loss.item()#总损失
+            total_loss+=loss.item()#总损失（每个batch的平均loss）
+            correct+=(output.argmax(dim=1)==y).sum().item()
+
         end=time.time()
-        print(f'epoch:{i+1}, loss:{total_loss/sam_num}, time:{end-start}')
-        #保存模型
-        torch.save(model.state_dict(), 'model.pth')
+        val_acc = validate(model, val_loader)
+
+        print(f'epoch:{i+1}, loss:{total_loss/len(train_loader):.4f}, '
+              f'train acc:{correct/sam_num:.4f}, val_acc:{val_acc:.4f}, '
+              f'lr:{optimizer.param_groups[0]["lr"]:.5f}, time:{end-start:.0f}s')
+
+        torch.save(model.state_dict(), 'last.pth')
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), 'best.pth')
+            print(f'新val_acc={val_acc:.4f}，已保存 best.pth')
+        scheduler.step()   # 每个 epoch 末衰减一次，必须在 batch 循环外
+    print(f'训练结束val_acc={best_acc:.4f}')
+
+
 #模型测试
 def evaluate(model, test_dataset):
     #数据加载
-    dataloader=DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    model=imgModule()#模型
-    model.load_state_dict(torch.load('model.pth'))#加载模型
+    dataloader=DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                          num_workers=2, pin_memory=True)
+    model.load_state_dict(torch.load('best.pth', map_location=device))
+    model.eval()
+    criterion=nn.CrossEntropyLoss()
     total_correct=0.0
     total_sample=0.0
-    total_loss=0
+    total_loss=0.0
     start=time.time()
-    #正确率
-    for x,y in dataloader:
-        model.eval()#
-        y_pred=model(x)
-        y_pred=torch.argmax(y_pred, dim=-1)
-        total_correct+=(y_pred==y).sum()
-        total_sample+=len(y)
+    with torch.no_grad():
+        for x,y in dataloader:
+            x,y=x.to(device),y.to(device)
+            y_pred=model(x)
+            total_loss+=criterion(y_pred,y).item()*len(x)# 乘批量，最后按样本数平均
+            correct=(y_pred.argmax(dim=1)==y).sum().item()
+            total_correct+=correct
+            total_sample+=len(y)
     acc=total_correct/total_sample
-    print(f'test acc:{acc}')
+    print(f'test acc:{acc:.4f} ({acc*100:.2f}%)')
     end=time.time()
-    print(f'test loss:{total_loss/total_sample}, time:{end-start}')
-
+    print(f'test loss:{total_loss/total_sample:.4f}, time:{end-start:.0f}s')
 
 
 
 
 
 if __name__ == '__main__':
-   #搭建神经网络
-    net = imgModule()
-    train_dataset, test_dataset = create_dataset()
-    #summary(net, (3, 32, 32),batch_size=BATCH_SIZE)
-    #模型训练
-    train(net, train_dataset)
-   #模型测试
-    evaluate(net, test_dataset)
-    print('王佳特nb')
+    torch.manual_seed(42)
+    torch.backends.cudnn.deterministic = True
+    print(f'使用设备: {device}')
+    net = imgModuleV2().to(device)
+    train_set, val_set = create_dataset()
+    print(net)
+    train(net, train_set, val_set, epoch=40)
+    evaluate(net, TinyImageNetVal())
+
 
 
 

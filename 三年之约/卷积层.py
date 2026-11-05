@@ -11,7 +11,7 @@ from PIL import features
 
 
 def dm01():
-    img=plt.imread('帅比.JPG')
+    img=plt.imread('资源/帅比.JPG')
     print(f'img{img},shape{img.shape}')#(2316, 3088, 3)
     img2=torch.tensor(img,dtype=torch.float)
     img2=img2.permute(2,0,1)

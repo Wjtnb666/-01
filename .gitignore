@@ -4,15 +4,21 @@
 # PyCharm 配置
 .idea/
 
-# CIFAR-10 数据集（341MB）
+# 数据集（几百MB，本地保留即可）
 三年之约/data/data/
 
 # 训练出的模型权重
 *.pth
+*.pt
+*.ckpt
+*.onnx
 
 # 个人图片（隐私）
 *.JPG
 三年之约/资源/
+
+# 脚本生成的图（每次重跑都变，不纳入版本控制）
+三年之约/proposals_vis.png
 
 # Python 缓存
 __pycache__/
